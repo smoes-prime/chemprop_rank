@@ -31,11 +31,93 @@ Kendall's tau
 Normalized Discounted Cumulative Gain (NDCG)
 Enrichment factors at different percentiles
 
-This feature helps researchers better evaluate model performance in scenarios where the relative ordering of predictions is more important than absolute values.
-Documentation and Usage
-Documentation can be found here.
-There are tutorial notebooks in the examples/ directory.
-Chemprop recently underwent a ground-up rewrite and new major release (v2.0.0). A helpful transition guide from Chemprop v1 to v2 can be found here. This includes a side-by-side comparison of CLI argument options, a list of which arguments will be implemented in later versions of v2, and a list of changes to default hyperparameters.
+### New RBO Loss Function
+
+In addition to the existing ranking metrics, Chemprop now supports Rank-Biased Overlap (RBO) as a differentiable loss function during training and as an evaluation metric:
+
+- **Implementation**: `RBOLoss` class in `chemprop/nn/metrics.py` computing `1 - RBO`
+- **CLI Options**:
+  - `--loss_function rbo` to select RBO loss
+  - `--rbo_p FLOAT` to set the persistence parameter _p_ (default 0.9)
+- **Usage**:
+  ```bash
+  chemprop_train --data_path data.csv --task_type regression \
+                 --loss_function rbo --rbo_p 0.95
+  ```
+- **Testing**: Unit tests added in `tests/unit/test_rbo_loss.py` for toy ranking examples
+- **Testing (RBO)**: Unit tests added in `tests/unit/test_rbo_loss.py` for toy ranking examples
+
+### NDCG@10% Evaluation Metric
+
+Chemprop now provides a Normalized Discounted Cumulative Gain metric focusing on the top 10% of predictions:
+
+- **Implementation**: `NDCGTopFraction` class in `chemprop/nn/metrics.py`
+- **CLI Options**:
+  - `--metrics ndcg` to compute NDCG@10% during evaluation
+- **Behavior**: Calculates DCG and IDCG over the top 10% of ranked compounds and reports the normalized score.
+
+**Usage (as evaluation metric)**:
+```bash
+chemprop_train --data_path data.csv --task_type regression \
+                --metrics ndcg --loss_function mse
+```
+
+**Running Tests**:
+To execute the new ranking-loss and ranking-metric unit tests:
+```bash
+# Run RBO loss tests
+pytest tests/unit/test_rbo_loss.py
+
+# Run NDCG@10% metric tests
+pytest tests/unit/test_ndcg_metric.py
+```
+
+This metric helps assess model ranking performance when only the top fraction of predictions are critical (e.g., virtual screening).
+
+### Differentiable Ranking Loss Functions
+
+Chemprop now supports several differentiable surrogate ranking losses that can be used to *optimize* ranking metrics directly:
+
+- **SoftRank** (`softrank`): Matches predicted soft-ranks to true ranks via MSE of soft rank estimates.
+- **ListNet** (`listnet`): Cross-entropy between ground-truth and predicted softmax distributions over scores.
+- **ListMLE** (`listmle`): Maximum likelihood over permutations following the ground-truth ordering.
+- **LambdaRank** (`lambdarank`): Pairwise logistic loss weighted by changes in NDCG.
+
+**CLI Options**:
+```bash
+# Common tau (temperature) parameter for all surrogate losses:
+--rank_tau FLOAT      # default 1.0
+
+# To train with SoftRank loss:
+--loss_function softrank --rank_tau 0.5
+
+# To train with ListNet loss:
+--loss_function listnet --rank_tau 1.0
+
+# To train with ListMLE loss:
+--loss_function listmle --rank_tau 1.0
+
+# To train with LambdaRank loss:
+--loss_function lambdarank --rank_tau 1.0
+```
+
+**Usage Example**:
+```bash
+chemprop_train --data_path data.csv --task_type regression \
+               --loss_function listnet --rank_tau 0.7
+```
+
+These losses are fully implemented in PyTorch and backpropagate gradients during training to directly improve ranking performance.
+
+### Running Tests for Ranking Losses and Metrics
+
+To run unit tests for all ranking losses and RBO/NDCG implementations:
+```bash
+pytest tests/unit/test_rbo_loss.py
+pytest tests/unit/test_ndcg_loss.py
+pytest tests/unit/test_ranking_losses.py
+```
+
 License: Chemprop is free to use under the MIT License. The Chemprop logo is free to use under CC0 1.0.
 References: Please cite the appropriate papers if Chemprop is helpful to your research.
 
@@ -49,27 +131,4 @@ Selected Applications: Chemprop has been successfully used in the following work
 A Deep Learning Approach to Antibiotic Discovery - Cell (2020): Chemprop was used to predict antibiotic activity against E. coli, leading to the discovery of Halicin, a novel antibiotic candidate. Model checkpoints are availabile on Zenodo.
 Discovery of a structural class of antibiotics with explainable deep learning - Nature (2023): Identified a structural class of antibiotics selective against methicillin-resistant S. aureus (MRSA) and vancomycin-resistant enterococci using ensembles of Chemprop models, and explained results using Chemprop's interpret method.
 ADMET-AI: A machine learning ADMET platform for evaluation of large-scale chemical libraries: Chemprop was trained on 41 absorption, distribution, metabolism, excretion, and toxicity (ADMET) datasets from the Therapeutics Data Commons. The Chemprop models in ADMET-AI are available both as a web server at admet.ai.greenstonebio.com and as a Python package at github.com/swansonk14/admet_ai.
-A more extensive list of successful Chemprop applications is given in our 2023 paper
-
-Version 1.x
-For users who have not yet made the switch to Chemprop v2.0, please reference the following resources.
-v1 Documentation
-
-Documentation of Chemprop v1 is available here. Note that the content of this site is several versions behind the final v1 release (v1.7.1) and does not cover the full scope of features available in chemprop v1.
-The v1 README is the best source for documentation on more recently-added features.
-Please also see descriptions of all the possible command line arguments in the v1 args.py file.
-
-v1 Tutorials and Examples
-
-Benchmark scripts - scripts from our 2023 paper, providing examples of many features using Chemprop v1.6.1
-ACS Fall 2023 Workshop - presentation, interactive demo, exercises on Google Colab with solution key
-Google Colab notebook - several examples, intended to be run in Google Colab rather than as a Jupyter notebook on your local machine
-nanoHUB tool - a notebook of examples similar to the Colab notebook above, doesn't require any installation
-
-YouTube video - lecture accompanying nanoHUB tool
-
-
-These slides provide a Chemprop tutorial and highlight additions as of April 28th, 2020
-
-v1 Known Issues
-We have discontinued support for v1 since v2 has been released, but we still appreciate v1 bug reports and will tag them as v1-wontfix so the community can find them easily.
+A more extensive list of successful Chemprop applications is given in the 2023 paper

@@ -1,4 +1,5 @@
 from abc import abstractmethod
+import math
 
 from numpy.typing import ArrayLike
 import torch
@@ -572,3 +573,207 @@ class QuantileLoss(ChempropMetric):
 
     def extra_repr(self) -> str:
         return f"alpha={self.alpha}"
+
+def _rbo(list_true, list_pred, p):
+    """Compute Rank-Biased Overlap (RBO) score between two ranked lists."""
+    max_k = max(len(list_true), len(list_pred))
+    overlap_size = 0.0
+    score = 0.0
+    weight = 1 - p
+    set_true = set()
+    set_pred = set()
+    for k in range(1, max_k + 1):
+        if k <= len(list_true):
+            set_true.add(list_true[k-1])
+        if k <= len(list_pred):
+            set_pred.add(list_pred[k-1])
+        overlap_size = len(set_true.intersection(set_pred))
+        score += weight * (p ** (k - 1)) * (overlap_size / k)
+    # residual term
+    score += (p ** max_k) * (overlap_size / max_k)
+    return score
+
+@LossFunctionRegistry.register("rbo")
+@MetricRegistry.register("rbo")
+class RBOLoss(ChempropMetric):
+    """Rank-Biased Overlap loss (1 - RBO) for ranking tasks."""
+
+    def __init__(self, p: float = 0.9, task_weights: ArrayLike = 1.0, **kwargs):
+        super().__init__(task_weights)
+        self.p = p
+        # buffers to accumulate lists across batches
+        self.preds_list = []
+        self.targets_list = []
+
+    def update(self, preds: Tensor, targets: Tensor, *args, **kwargs) -> None:
+        # preds and targets are b x t
+        for pr, tr in zip(preds.tolist(), targets.tolist()):
+            self.preds_list.append(pr)
+            self.targets_list.append(tr)
+
+    def compute(self) -> Tensor:
+        # compute average RBO across all samples and return 1 - RBO
+        rbo_vals = []
+        for true_scores, pred_scores in zip(self.targets_list, self.preds_list):
+            # obtain ranked indices by descending score
+            true_order = [idx for _, idx in sorted(zip(true_scores, range(len(true_scores))), reverse=True)]
+            pred_order = [idx for _, idx in sorted(zip(pred_scores, range(len(pred_scores))), reverse=True)]
+            rbo_vals.append(_rbo(true_order, pred_order, self.p))
+        avg_rbo = float(sum(rbo_vals) / len(rbo_vals)) if rbo_vals else 0.0
+        return torch.tensor(1.0 - avg_rbo)
+
+
+@LossFunctionRegistry.register("ndcg")
+class NDCGLoss(ChempropMetric):
+    """Normalized Discounted Cumulative Gain loss at top fraction (1 - NDCG@fraction)."""
+
+    def __init__(self, fraction: float = 0.1, task_weights: ArrayLike = 1.0, **kwargs):
+        super().__init__(task_weights)
+        self.fraction = fraction
+        # buffers to accumulate lists across batches
+        self.preds_list = []
+        self.targets_list = []
+
+    def update(self, preds: Tensor, targets: Tensor, *args, **kwargs) -> None:
+        # preds and targets are b x t
+        for pr, tr in zip(preds.tolist(), targets.tolist()):
+            self.preds_list.append(pr)
+            self.targets_list.append(tr)
+
+    def compute(self) -> Tensor:
+        import math
+        ndcg_vals = []
+        for true_scores, pred_scores in zip(self.targets_list, self.preds_list):
+            t = len(true_scores)
+            k = max(1, int(t * self.fraction))
+            ideal = sorted(true_scores, reverse=True)
+            pred_idx = [idx for _, idx in sorted(zip(pred_scores, range(t)), reverse=True)]
+            dcg = sum(true_scores[pred_idx[i]] / math.log2(i + 2) for i in range(k))
+            idcg = sum(ideal[i] / math.log2(i + 2) for i in range(k))
+            ndcg_vals.append(dcg / idcg if idcg > 0 else 0.0)
+        avg_ndcg = float(sum(ndcg_vals) / len(ndcg_vals)) if ndcg_vals else 0.0
+        # return 1 - average NDCG
+        return torch.tensor(1.0 - avg_ndcg)
+
+
+torch = torch  # ensure torch is in scope
+
+@LossFunctionRegistry.register("softrank")
+class SoftRankLoss(ChempropMetric):
+    """SoftRank loss matching differentiable rank estimates between preds and targets."""
+
+    def __init__(self, tau: float = 1.0, task_weights: ArrayLike = 1.0, **kwargs):
+        super().__init__(task_weights)
+        self.tau = tau
+        self.preds_list = []
+        self.targets_list = []
+
+    def update(self, preds: Tensor, targets: Tensor, *args, **kwargs) -> None:
+        self.preds_list += preds.tolist()
+        self.targets_list += targets.tolist()
+
+    def compute(self) -> Tensor:
+        losses = []
+        for pr, tr in zip(self.preds_list, self.targets_list):
+            s = torch.tensor(pr, dtype=torch.float, device=self.task_weights.device)
+            y = torch.tensor(tr, dtype=torch.float, device=self.task_weights.device)
+            # compute soft ranks: r_i = 1 + sum_j sigmoid((s_j - s_i)/tau)
+            diffs_s = s.unsqueeze(1) - s.unsqueeze(0)
+            P = torch.sigmoid(-diffs_s / self.tau)
+            r_s = 1 + P.sum(dim=1)
+            diffs_y = y.unsqueeze(1) - y.unsqueeze(0)
+            P_y = torch.sigmoid(-diffs_y / self.tau)
+            r_y = 1 + P_y.sum(dim=1)
+            losses.append(F.mse_loss(r_s, r_y))
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0)
+
+@LossFunctionRegistry.register("listnet")
+class ListNetLoss(ChempropMetric):
+    """ListNet loss using cross-entropy between ground truth and predicted softmax distributions."""
+
+    def __init__(self, tau: float = 1.0, task_weights: ArrayLike = 1.0, **kwargs):
+        super().__init__(task_weights)
+        self.tau = tau
+        self.preds_list = []
+        self.targets_list = []
+
+    def update(self, preds: Tensor, targets: Tensor, *args, **kwargs) -> None:
+        self.preds_list += preds.tolist()
+        self.targets_list += targets.tolist()
+
+    def compute(self) -> Tensor:
+        losses = []
+        for pr, tr in zip(self.preds_list, self.targets_list):
+            s = torch.tensor(pr, dtype=torch.float, device=self.task_weights.device)
+            y = torch.tensor(tr, dtype=torch.float, device=self.task_weights.device)
+            P_y = F.softmax(y / self.tau, dim=0)
+            P_s = F.softmax(s / self.tau, dim=0)
+            losses.append(-(P_y * torch.log(P_s + 1e-20)).sum())
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0)
+
+@LossFunctionRegistry.register("listmle")
+class ListMLELoss(ChempropMetric):
+    """ListMLE loss maximizing likelihood of the ground truth ranking."""
+
+    def __init__(self, tau: float = 1.0, task_weights: ArrayLike = 1.0, **kwargs):
+        super().__init__(task_weights)
+        self.tau = tau
+        self.preds_list = []
+        self.targets_list = []
+
+    def update(self, preds: Tensor, targets: Tensor, *args, **kwargs) -> None:
+        self.preds_list += preds.tolist()
+        self.targets_list += targets.tolist()
+
+    def compute(self) -> Tensor:
+        losses = []
+        for pr, tr in zip(self.preds_list, self.targets_list):
+            s = torch.tensor(pr, dtype=torch.float, device=self.task_weights.device)
+            y = torch.tensor(tr, dtype=torch.float, device=self.task_weights.device)
+            # sort by ground truth
+            idx = torch.argsort(y, descending=True)
+            s_sorted = s[idx]
+            loss = torch.tensor(0.0, device=self.task_weights.device)
+            for i in range(len(s_sorted)):
+                slice_logits = s_sorted[i:]
+                log_probs = F.log_softmax(slice_logits / self.tau, dim=0)
+                loss = loss - log_probs[0]
+            losses.append(loss)
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0)
+
+@LossFunctionRegistry.register("lambdarank")
+class LambdaRankLoss(ChempropMetric):
+    """LambdaRank loss approximating changes in NDCG via pairwise logistic."""
+
+    def __init__(self, tau: float = 1.0, task_weights: ArrayLike = 1.0, **kwargs):
+        super().__init__(task_weights)
+        self.tau = tau
+        self.preds_list = []
+        self.targets_list = []
+
+    def update(self, preds: Tensor, targets: Tensor, *args, **kwargs) -> None:
+        self.preds_list += preds.tolist()
+        self.targets_list += targets.tolist()
+
+    def compute(self) -> Tensor:
+        losses = []
+        for pr, tr in zip(self.preds_list, self.targets_list):
+            s = torch.tensor(pr, dtype=torch.float, device=self.task_weights.device)
+            y = torch.tensor(tr, dtype=torch.float, device=self.task_weights.device)
+            t = len(y)
+            # ideal DCG
+            ideal, _ = torch.sort(y, descending=True)
+            idcg = sum((ideal[i] / math.log2(i + 2)) for i in range(t))
+            if idcg == 0:
+                continue
+            loss = torch.tensor(0.0, device=self.task_weights.device)
+            for i in range(t):
+                for j in range(t):
+                    if i == j:
+                        continue
+                    delta = abs((2**y[i] - 2**y[j]) *
+                                (1 / math.log2(i + 2) - 1 / math.log2(j + 2))) / idcg
+                    S = s[i] - s[j]
+                    loss = loss + delta * torch.log(1 + torch.exp(-S / self.tau))
+            losses.append(loss)
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0)

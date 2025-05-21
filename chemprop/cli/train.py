@@ -357,8 +357,21 @@ def add_train_args(parser: ArgumentParser) -> ArgumentParser:
         "-l",
         "--loss-function",
         action=LookupAction(LossFunctionRegistry),
-        help="Loss function to use during training (will use the default loss function for the given task type if not specified)",
+        help="Loss function to use during training (including 'rbo' and 'ndcg'; uses default for task if unspecified)",
     )
+    train_args.add_argument(
+        "--rbo_p",
+        type=float,
+        default=0.9,
+        help="Persistence parameter p for Rank-Biased Overlap loss (only used when --loss_function rbo)",
+    )
+    train_args.add_argument(
+        "--rank_tau",
+        type=float,
+        default=1.0,
+        help="Tau (temperature) parameter for differentiable ranking losses (SoftRank, ListNet, ListMLE, LambdaRank)",
+    )
+
     train_args.add_argument(
         "--v-kl",
         "--evidential-regularization",
@@ -1103,14 +1116,33 @@ def build_model(
     predictor_cls = PredictorRegistry[args.task_type]
     if args.loss_function is not None:
         task_weights = torch.ones(n_tasks) if args.task_weights is None else args.task_weights
-        criterion = Factory.build(
-            LossFunctionRegistry[args.loss_function],
-            task_weights=task_weights,
-            v_kl=args.v_kl,
-            # threshold=args.threshold, TODO: Add in v2.1
-            eps=args.eps,
-            alpha=args.alpha,
-        )
+        # Instantiate loss function, handling custom ranking losses specially
+        if args.loss_function == 'rbo':
+            from chemprop.nn.metrics import RBOLoss
+            criterion = RBOLoss(p=args.rbo_p, task_weights=task_weights)
+        elif args.loss_function == 'ndcg':
+            from chemprop.nn.metrics import NDCGLoss
+            criterion = NDCGLoss(fraction=args.ndcg_fraction, task_weights=task_weights)
+        elif args.loss_function == 'softrank':
+            from chemprop.nn.metrics import SoftRankLoss
+            criterion = SoftRankLoss(tau=args.rank_tau, task_weights=task_weights)
+        elif args.loss_function == 'listnet':
+            from chemprop.nn.metrics import ListNetLoss
+            criterion = ListNetLoss(tau=args.rank_tau, task_weights=task_weights)
+        elif args.loss_function == 'listmle':
+            from chemprop.nn.metrics import ListMLELoss
+            criterion = ListMLELoss(tau=args.rank_tau, task_weights=task_weights)
+        elif args.loss_function == 'lambdarank':
+            from chemprop.nn.metrics import LambdaRankLoss
+            criterion = LambdaRankLoss(tau=args.rank_tau, task_weights=task_weights)
+        else:
+            criterion = Factory.build(
+                LossFunctionRegistry[args.loss_function],
+                task_weights=task_weights,
+                v_kl=args.v_kl,
+                eps=args.eps,
+                alpha=args.alpha,
+            )
     else:
         criterion = None
     if args.metrics is not None:
